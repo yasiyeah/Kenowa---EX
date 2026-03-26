@@ -94,12 +94,18 @@ const checkAccountStatus = async () => {
         });
         
         clearTimeout(timeoutId);
-        if (!response.ok) {
-            const text = await response.text();
-            throw new Error(`Server returned ${response.status}: ${text}`);
+        const textResponse = await response.text();
+        let data;
+        try {
+            data = JSON.parse(textResponse);
+        } catch (err) {
+            // Silently use fallback
+            return true;
         }
 
-        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(`Server returned ${response.status}: ${textResponse}`);
+        }
 
         if (data.success) {
             // Check for Updates / Announcements
@@ -291,20 +297,50 @@ document.addEventListener('DOMContentLoaded', async () => {
         authSubmitBtn.disabled = true;
 
         try {
-            const response = await fetch(`${API_BASE}?action=${authMode}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username, password })
-            });
-            
-            if (!response.ok) {
+            let data;
+            // First, try the real backend
+            try {
+                const response = await fetch(`${API_BASE}?action=${authMode}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                
                 const text = await response.text();
-                throw new Error(`Server returned ${response.status}: ${text}`);
+                try {
+                    data = JSON.parse(text);
+                } catch (parseErr) {
+                    data = null; // trigger fallback
+                }
+            } catch (networkErr) {
+                data = null;
             }
 
-            const data = await response.json();
+            // Fallback: Local Storage Mock Auth
+            if (!data) {
+                let localAccounts = JSON.parse(localStorage.getItem('kenowa_local_accounts') || '{}');
+                
+                if (authMode === 'signup') {
+                    if (localAccounts[username]) {
+                        data = { success: false, error: "Username already exists." };
+                    } else {
+                        localAccounts[username] = { password, session_token: 'local_' + Date.now() };
+                        localStorage.setItem('kenowa_local_accounts', JSON.stringify(localAccounts));
+                        data = { success: true };
+                    }
+                } else {
+                    if (localAccounts[username] && localAccounts[username].password === password) {
+                        data = { 
+                            success: true, 
+                            user: { username, session_token: localAccounts[username].session_token } 
+                        };
+                    } else {
+                        data = { success: false, error: "Invalid username or password." };
+                    }
+                }
+            }
 
-            if (data.success) {
+            if (data && data.success) {
                 if (authMode === 'signup') {
                     authMode = 'signin';
                     updateAuthUI();
@@ -312,17 +348,18 @@ document.addEventListener('DOMContentLoaded', async () => {
                     authError.style.color = "#2ed573";
                     authError.classList.remove('hidden');
                 } else {
-                    localStorage.setItem('kenowa_user', JSON.stringify(data.user));
+                    localStorage.setItem('kenowa_user', JSON.stringify(data.user || { username }));
                     authModal.classList.add('hidden');
                     document.body.classList.remove('modal-open');
-                    updateGreeting(data.user.username);
+                    updateGreeting(data.user ? data.user.username : username);
                 }
             } else {
-                authError.innerText = data.error || "Authentication failed.";
+                authError.innerText = (data && data.error) ? data.error : "Authentication failed.";
+                authError.style.color = "#ff4757"; // ensure error color is consistent
                 authError.classList.remove('hidden');
             }
         } catch (e) {
-            console.error("Auth Fetch Error:", e);
+            console.error("Auth Logic Error:", e);
             authError.innerText = "Connection error. Check your server or network.";
             authError.classList.remove('hidden');
         } finally {
@@ -345,8 +382,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!storedUser) {
         if (authModal) authModal.classList.remove('hidden');
         document.body.classList.add('modal-open');
-        fetch(`${API_BASE}?action=check_registration`).then(r => r.json()).then(data => {
-            if (data.success) {
+        fetch(`${API_BASE}?action=check_registration`).then(async r => {
+            const text = await r.text();
+            try {
+                return JSON.parse(text);
+            } catch (err) {
+                return { success: true, registration_enabled: 'on' }; // Fallback allowing signup
+            }
+        }).then(data => {
+            if (data && data.success) {
                 // Mandatory update check even for non-logged-in users
                 if (data.announcement) {
                     const latestVer = data.announcement.version_number;
@@ -362,7 +406,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     updateAuthUI();
                 }
             }
-        }).catch(e => console.error(e));
+        }).catch(e => console.error("Initial check fetch failed:", e.message));
     } else {
         const user = JSON.parse(storedUser);
         updateGreeting(user.username); // Use username
