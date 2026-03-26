@@ -17,12 +17,18 @@ let currentMode = 'quick'; // 'quick', 'deep', 'image'
 let currentDraftImages = [];
 let isExamMode = false;
 let examModeTimeout = null;
+let examModeTabId = null;
+let examModeStartTime = null;
+
+let currentActiveTabId = null;
+let currentTabChatMap = {}; // { tabId: chatId }
 
 const APP_VERSION = "1.0.0"; 
 
 // Auth & Maintenance Globals
 const API_BASE = "https://kenowa.synergize.co/server/auth.php";
 let authModal, authFormContainer, maintenanceMsg, authUsernameInput, authPasswordInput, authSubmitBtn, authError, tabSignin, tabSignup, authTitle;
+let examDelayInput;
 
 const isVersionOlder = (current, latest) => {
     if (!latest) return false;
@@ -416,17 +422,41 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
     try {
-        const lastId = await loadChats();
-        if (lastId && chats[lastId]) {
-            loadChat(lastId, false); // Don't toggle sidebar on auto-load
+        await loadChats();
+        initTabTracking();
+    } catch (e) {
+        console.error(e);
+        initTabTracking();
+    }
+});
+
+function initTabTracking() {
+    chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+        if (tabs && tabs[0]) {
+            currentActiveTabId = tabs[0].id;
+            startNewChat(); // Default new chat for this tab session
+        }
+    });
+
+    chrome.tabs.onActivated.addListener(activeInfo => {
+        currentActiveTabId = activeInfo.tabId;
+        if (currentTabChatMap[currentActiveTabId] && chats[currentTabChatMap[currentActiveTabId]]) {
+            loadChat(currentTabChatMap[currentActiveTabId], false);
         } else {
             startNewChat();
         }
-    } catch (e) {
-        console.error(e);
-        startNewChat();
-    }
-});
+
+        if (examModeBtn) {
+            if (isExamMode && examModeTabId === currentActiveTabId) {
+                examModeBtn.classList.add('mic-active');
+                examModeBtn.style.color = '#4caf50';
+            } else {
+                examModeBtn.classList.remove('mic-active');
+                examModeBtn.style.color = '';
+            }
+        }
+    });
+}
 
 
 // Event Delegation for Dynamic Content (Code Copy Buttons)
@@ -486,6 +516,10 @@ function startNewChat() {
     }
     if (historySidebar) historySidebar.classList.remove('show');
     clearImages();
+
+    if (currentActiveTabId) {
+        currentTabChatMap[currentActiveTabId] = currentChatId;
+    }
 
     isGenerating = false;
     toggleSendButton(false);
@@ -1188,6 +1222,7 @@ const providerInput = document.getElementById('settings-provider-input');
 const keyInput = document.getElementById('settings-key-input');
 const openRouterKeyInput = document.getElementById('settings-openrouter-key-input');
 const modelInput = document.getElementById('settings-model-input');
+examDelayInput = document.getElementById('settings-exam-delay-input');
 
 if (settingsBtn) {
     settingsBtn.addEventListener('click', () => {
@@ -1198,6 +1233,7 @@ if (settingsBtn) {
             keyInput.value = localStorage.getItem('kenowa_api_key') || '';
             openRouterKeyInput.value = localStorage.getItem('kenowa_openrouter_key') || '';
             modelInput.value = localStorage.getItem('kenowa_model') || MODEL_QUICK;
+            if (examDelayInput) examDelayInput.checked = localStorage.getItem('kenowa_exam_delay') !== 'false';
         }
         if (historySidebar) historySidebar.classList.remove('show'); 
     });
@@ -1209,6 +1245,7 @@ if (saveSettingsBtn) {
         localStorage.setItem('kenowa_api_key', keyInput.value.trim());
         localStorage.setItem('kenowa_openrouter_key', openRouterKeyInput.value.trim());
         localStorage.setItem('kenowa_model', modelInput.value);
+        if (examDelayInput) localStorage.setItem('kenowa_exam_delay', examDelayInput.checked);
 
         // Feedback UI
         const originalText = saveSettingsBtn.innerText;
@@ -1372,51 +1409,240 @@ async function apiGenerateText(prompt) {
     return null;
 }
 
+let lastExamPageSignature = "";
+let lastExamAnswer = "";
+let examCountdownInterval = null;
+
+function examAppendMessage(text) {
+    if (!examModeTabId || !currentTabChatMap[examModeTabId]) {
+        // Fallback or early
+        appendMessage('ai', text);
+        return;
+    }
+
+    let targetChatId = currentTabChatMap[examModeTabId];
+
+    if (currentActiveTabId === examModeTabId) {
+        // Exam tab is currently open, safe to update DOM
+        appendMessage('ai', text);
+    } else {
+        // Exam tab is hidden. Append silently to chat history.
+        if (!chats[targetChatId]) {
+            chats[targetChatId] = {
+                title: text.substring(0, 30) + '...',
+                messages: [],
+                timestamp: Date.now()
+            };
+        }
+        chats[targetChatId].messages.push({ role: 'ai', content: text, images: [] });
+        saveChats();
+    }
+}
+
+function updateExamCountdown() {
+    if (!isExamMode || !examModeStartTime) return;
+    const isExamDelayEnabled = localStorage.getItem('kenowa_exam_delay') !== 'false';
+    if (!isExamDelayEnabled) return;
+
+    if (currentActiveTabId !== examModeTabId) {
+        // If we are on another tab, hide the countdown DOM
+        if (typingIndicator && !typingIndicator.classList.contains('hidden') && typingIndicator.innerHTML.includes('Exam Mode')) {
+            typingIndicator.classList.add('hidden');
+        }
+        return; // do nothing DOM-wise
+    }
+
+    const EXAM_DURATION = 30 * 60 * 1000; 
+    let timeElapsed = Date.now() - examModeStartTime;
+    let timeLeft = EXAM_DURATION - timeElapsed;
+    
+    if (timeLeft > 0) {
+        let mins = Math.floor(timeLeft / 60000);
+        let secs = Math.floor((timeLeft % 60000) / 1000);
+        let msg = `Exam Mode: Waiting to submit (${mins}m ${secs}s left)`;
+        
+        if (!typingIndicator.classList.contains('hidden')) {
+            const span = typingIndicator.querySelector('.thinking-text');
+            if (span && span.innerText.includes('Exam Mode')) {
+                span.innerText = msg;
+            }
+        } else {
+            typingIndicator.innerHTML = `<span class="thinking-text">${msg}</span>`;
+            typingIndicator.classList.add('thinking-indicator');
+            typingIndicator.classList.remove('hidden');
+        }
+    } else {
+         const span = typingIndicator.querySelector('.thinking-text');
+         if (span) span.innerText = `Exam Mode: Submitting...`;
+    }
+}
+
+async function executeExamClicker(tabId, answerText, shouldSubmit, isExamDelayEnabled) {
+    await chrome.scripting.executeScript({
+         target: { tabId: tabId },
+         args: [answerText, shouldSubmit, isExamDelayEnabled],
+         func: (answerText, shouldSubmit, isExamDelayEnabled) => {
+             // Parse AI response
+             let aiAnswers = [];
+             try {
+                 let jsonMatch = answerText.match(/\[[\s\S]*\]/);
+                 if (jsonMatch) {
+                     aiAnswers = JSON.parse(jsonMatch[0]);
+                 } else {
+                     aiAnswers = [answerText];
+                 }
+             } catch(e) {
+                 aiAnswers = [answerText];
+             }
+
+             aiAnswers.forEach(ans => {
+                 if (typeof ans !== 'string') return;
+                 let cleanAnswer = ans.trim();
+                 cleanAnswer = cleanAnswer.replace(/^[A-Z][\.\)]\s*/, '').toLowerCase();
+                 if (!cleanAnswer) return;
+
+                 let elements = Array.from(document.querySelectorAll('label, div, span, button, p'));
+                 
+                 let getScore = (el) => {
+                     let text = el.innerText ? el.innerText.trim().toLowerCase() : '';
+                     if(!text) return 0;
+                     if (text === cleanAnswer) return 100;
+                     if (text.includes(cleanAnswer) && cleanAnswer.length > 2) return (cleanAnswer.length / text.length) * 100;
+                     return 0;
+                 };
+
+                 let bestElement = null;
+                 let bestScore = 1; 
+                 elements.forEach(el => {
+                     let score = getScore(el);
+                     if(score > bestScore && el.children.length === 0) { 
+                         bestScore = score;
+                         bestElement = el;
+                     }
+                 });
+
+                 if (bestElement) {
+                     bestElement.click();
+                     let parent = bestElement.parentElement;
+                     if(parent) {
+                         let inputs = parent.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+                         if(inputs.length > 0) inputs[0].click();
+                     }
+                 }
+             });
+
+             // Block user manual submit
+             if (isExamDelayEnabled && !shouldSubmit) {
+                 let allBtns = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a'));
+                 allBtns.forEach(b => {
+                     let t = (b.innerText || b.value || '').toLowerCase();
+                     if (t.includes('submit all and finish') || t.includes('finish attempt') || t === 'submit') {
+                         if (!b.classList.contains('kenowa-blocked')) {
+                             b.style.pointerEvents = 'none';
+                             b.style.opacity = '0.4';
+                             b.title = "Manual submit blocked. Auto-submit after 30 mins.";
+                             b.classList.add('kenowa-blocked');
+                         }
+                     }
+                 });
+             }
+
+             // Click Next/Submit Buttons
+             setTimeout(() => {
+                 let allBtns = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a'));
+                 
+                 let submitAllBtns = allBtns.filter(b => (b.innerText || b.value || '').toLowerCase().includes('submit all and finish'));
+                 let finishAttemptBtns = allBtns.filter(b => (b.innerText || b.value || '').toLowerCase().includes('finish attempt'));
+                 let nextBtns = allBtns.filter(b => /^(next|continue)\b/i.test(b.innerText || b.value || ''));
+                 let submitBtns = allBtns.filter(b => (b.innerText || b.value || '').toLowerCase() === 'submit');
+
+                 if (shouldSubmit) {
+                     if (submitAllBtns.length > 0) submitAllBtns[0].click();
+                     else if (finishAttemptBtns.length > 0) finishAttemptBtns[0].click();
+                     else if (submitBtns.length > 0) submitBtns[0].click();
+                     else if (nextBtns.length > 0) nextBtns[0].click();
+                 } else {
+                     if (nextBtns.length > 0) nextBtns[0].click();
+                 }
+             }, 1000);
+         }
+    });
+}
+
 function toggleExamMode() {
+    if (isExamMode && examModeTabId !== null && currentActiveTabId !== examModeTabId) {
+        appendMessage('ai', 'Exam Mode is currently running on another tab. Please stop it there first.');
+        return;
+    }
+
     isExamMode = !isExamMode;
     if (isExamMode) {
         if (examModeBtn) {
             examModeBtn.classList.add('mic-active');
             examModeBtn.style.color = '#4caf50';
         }
-        appendMessage('ai', 'Exam Mode Activated. Automatically scanning for questions, solving them, clicking the correct option, and proceeding to Next or Submit when time is up.');
-        runExamModeStep();
+        
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            if (tabs && tabs[0]) {
+                examModeTabId = tabs[0].id;
+                examModeStartTime = Date.now();
+                lastExamPageSignature = "";
+                lastExamAnswer = "";
+                
+                examAppendMessage('Exam Mode Activated. Automatically scanning for questions, solving them, clicking the correct option, and proceeding to Next or Submit when time is up.');
+
+                if (localStorage.getItem('kenowa_exam_delay') !== 'false') {
+                    examCountdownInterval = setInterval(updateExamCountdown, 1000);
+                }
+
+                runExamModeStep();
+            }
+        });
     } else {
         if (examModeBtn) {
             examModeBtn.classList.remove('mic-active');
             examModeBtn.style.color = '';
         }
+
+        examAppendMessage('Exam Mode Deactivated.');
+
+        examModeTabId = null;
         clearTimeout(examModeTimeout);
-        hideTypingIndicator();
-        appendMessage('ai', 'Exam Mode Deactivated.');
+        if (examCountdownInterval) {
+            clearInterval(examCountdownInterval);
+            examCountdownInterval = null;
+        }
+
+        if (currentActiveTabId === examModeTabId || typingIndicator && typingIndicator.innerHTML.includes('Exam Mode')) {
+            hideTypingIndicator();
+        }
     }
 }
 
 async function runExamModeStep() {
-    if (!isExamMode) return;
+    if (!isExamMode || !examModeTabId) return;
 
     try {
-        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!tabs || tabs.length === 0) {
-            toggleExamMode();
-            return;
-        }
-        const tab = tabs[0];
-
-        if (!tab.url || tab.url.startsWith('chrome://')) {
-            appendMessage('ai', 'Exam mode cannot run on system pages.');
-            toggleExamMode();
+        let tab;
+        try {
+            tab = await chrome.tabs.get(examModeTabId);
+        } catch(e) {
+            examAppendMessage('Exam tab closed. Disabling Exam Mode.');
+            if (isExamMode) toggleExamMode();
             return;
         }
 
-        showTypingIndicator("Exam Mode: Scanning page...");
+        if (!tab || !tab.url || tab.url.startsWith('chrome://')) {
+            examAppendMessage('Exam mode cannot run on system pages.');
+            if (isExamMode) toggleExamMode();
+            return;
+        }
 
         const extraction = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: { tabId: examModeTabId },
             func: () => {
                 let text = document.body.innerText;
                 let isExamComplete = false;
-                // Basic check if its a complete exam/score screen
                 if(text.toLowerCase().includes('score') && text.toLowerCase().includes('result')) {
                     isExamComplete = true;
                 }
@@ -1429,12 +1655,35 @@ async function runExamModeStep() {
         }
 
         if(extraction[0].result.isExamComplete) {
-            appendMessage('ai', 'Exam appears to be complete.');
-            toggleExamMode();
+            examAppendMessage('Exam appears to be complete.');
+            if (isExamMode) toggleExamMode();
             return;
         }
         
         const pageText = extraction[0].result.text.substring(0, 15000);
+        let textForSignature = extraction[0].result.text.replace(/\d+/g, '').replace(/\s+/g, ' ').trim();
+        
+        const isExamDelayEnabled = localStorage.getItem('kenowa_exam_delay') !== 'false';
+        const EXAM_DURATION = 30 * 60 * 1000;
+        const timeElapsed = Date.now() - examModeStartTime;
+        const shouldSubmit = !isExamDelayEnabled || (timeElapsed >= EXAM_DURATION);
+
+        // Skip API request if we are stuck on the exact same page waiting for timer
+        if (textForSignature === lastExamPageSignature && lastExamAnswer) {
+             await executeExamClicker(examModeTabId, lastExamAnswer, shouldSubmit, isExamDelayEnabled);
+             
+             if (shouldSubmit && isExamDelayEnabled) {
+                 examAppendMessage('Exam Mode 30-minute timer ended. Auto-submitting and disabling Exam Mode automatically.');
+                 if (isExamMode) toggleExamMode();
+                 return;
+             }
+
+             if (isExamMode) {
+                 examModeTimeout = setTimeout(runExamModeStep, 4000);
+             }
+             return;
+        }
+
         const prompt = `You are an expert test-taking assistant. Extracted text from an exam page:
 ${pageText}
 
@@ -1443,100 +1692,35 @@ Reply with a JSON array containing ONLY the exact text of the correct options as
 Example: ["First correct answer text", "Second correct answer text"]
 IMPORTANT: Only output the valid JSON array, no other text or explanation.`;
 
+        if (!examCountdownInterval && currentActiveTabId === examModeTabId) {
+            showTypingIndicator("Exam Mode: Scanning page...");
+        }
+
         const aiAnswer = await apiGenerateText(prompt);
 
         if (!aiAnswer || aiAnswer.trim() === '') {
-             appendMessage('ai', 'Exam Mode: Failed to determine answer. Trying again soon.');
+             examAppendMessage('Exam Mode: Failed to determine answer. Trying again soon.');
         } else {
-             appendMessage('ai', 'Exam Mode Found Answer: ' + aiAnswer);
+             lastExamPageSignature = textForSignature;
+             lastExamAnswer = aiAnswer;
+             examAppendMessage('Exam Mode Found Answer: ' + aiAnswer);
+             await executeExamClicker(examModeTabId, aiAnswer, shouldSubmit, isExamDelayEnabled);
 
-             // Inject script to click option and proceed
-             await chrome.scripting.executeScript({
-                 target: { tabId: tab.id },
-                 args: [aiAnswer],
-                 func: (answerText) => {
-                     // Parse AI response
-                     let aiAnswers = [];
-                     try {
-                         let jsonMatch = answerText.match(/\[[\s\S]*\]/);
-                         if (jsonMatch) {
-                             aiAnswers = JSON.parse(jsonMatch[0]);
-                         } else {
-                             aiAnswers = [answerText];
-                         }
-                     } catch(e) {
-                         aiAnswers = [answerText];
-                     }
-
-                     aiAnswers.forEach(ans => {
-                         if (typeof ans !== 'string') return;
-                         let cleanAnswer = ans.trim();
-                         // Remove leading A. B. etc which AI might add
-                         cleanAnswer = cleanAnswer.replace(/^[A-Z][\.\)]\s*/, '').toLowerCase();
-                         if (!cleanAnswer) return;
-
-                         let elements = Array.from(document.querySelectorAll('label, div, span, button, p'));
-                         
-                         // Helper score
-                         let getScore = (el) => {
-                             let text = el.innerText ? el.innerText.trim().toLowerCase() : '';
-                             if(!text) return 0;
-                             if (text === cleanAnswer) return 100;
-                             if (text.includes(cleanAnswer) && cleanAnswer.length > 2) return (cleanAnswer.length / text.length) * 100;
-                             return 0;
-                         };
-
-                         let bestElement = null;
-                         let bestScore = 1; // Needs to be > 1
-                         elements.forEach(el => {
-                             let score = getScore(el);
-                             if(score > bestScore && el.children.length === 0) { // Prefer leaf nodes
-                                 bestScore = score;
-                                 bestElement = el;
-                             }
-                         });
-
-                         if (bestElement) {
-                             bestElement.click();
-                             let parent = bestElement.parentElement;
-                             if(parent) {
-                                 let inputs = parent.querySelectorAll('input[type="radio"], input[type="checkbox"]');
-                                 if(inputs.length > 0) inputs[0].click();
-                             }
-                         }
-                     });
-
-                     // Click Next/Submit Buttons
-                     setTimeout(() => {
-                         let allBtns = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a'));
-                         
-                         let submitAllBtns = allBtns.filter(b => (b.innerText || b.value || '').toLowerCase().includes('submit all and finish'));
-                         let finishAttemptBtns = allBtns.filter(b => (b.innerText || b.value || '').toLowerCase().includes('finish attempt'));
-                         let nextBtns = allBtns.filter(b => /^(next|continue)\b/i.test(b.innerText || b.value || ''));
-                         let submitBtns = allBtns.filter(b => (b.innerText || b.value || '').toLowerCase().includes('submit'));
-
-                         if (submitAllBtns.length > 0) {
-                             submitAllBtns[0].click();
-                         } else if (finishAttemptBtns.length > 0) {
-                             finishAttemptBtns[0].click();
-                         } else if (nextBtns.length > 0) {
-                             nextBtns[0].click();
-                         } else if (submitBtns.length > 0) {
-                             submitBtns[0].click();
-                         }
-                     }, 1000);
-                 }
-             });
+             if (shouldSubmit && isExamDelayEnabled) {
+                 examAppendMessage('Exam Mode 30-minute timer ended. Auto-submitting and disabling Exam Mode automatically.');
+                 if (isExamMode) toggleExamMode();
+                 return;
+             }
         }
 
-        // Loop next step after delay
         if (isExamMode) {
             examModeTimeout = setTimeout(runExamModeStep, 4000);
         }
 
     } catch (err) {
         console.error("Exam Mode Error:", err);
-        appendMessage('ai', 'Exam Mode Error: ' + err.message);
-        toggleExamMode();
+        examAppendMessage('Exam Mode Error: ' + err.message);
+        if (isExamMode) toggleExamMode();
     }
 }
+

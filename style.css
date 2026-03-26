@@ -873,7 +873,7 @@ code {
   /* Push to bottom */
 }
 
-.settings-link-btn {
+.settings-link-btn, .logout-link-btn {
   width: 100%;
   background: none;
   border: none;
@@ -888,7 +888,7 @@ code {
   transition: all 0.2s;
 }
 
-.settings-link-btn:hover {
+.settings-link-btn:hover, .logout-link-btn:hover {
   background: var(--bg-hover);
   color: var(--text-main);
 }

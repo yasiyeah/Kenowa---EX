@@ -21,6 +21,10 @@
 - **Windows/Linux**: `Ctrl+Shift+3`
 - **Mac**: `Command+Shift+3`
 
+## 📚 Help & Documentation
+
+For user guides and troubleshooting, please check the [Kenowa Help Page](https://kenowa.synergize.co/help.html).
+
 ## ⚖️ Conclusion & Disclaimer
 
 > [!CAUTION]  
